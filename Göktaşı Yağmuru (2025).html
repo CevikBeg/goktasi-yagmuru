@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Göktaşı Yağmuru</title>
+<style>
+  :root { --fg:#0f2810; --lcd:#cfe9c6; --ink:#0a4a0a; }
+  html, body { height:100%; margin:0; background:#111; color:#e7ffe7; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+  .wrap { display:flex; flex-direction:column; align-items:center; gap:12px; padding:18px; }
+  .bezel { background:#0a0a0a; padding:14px 14px 10px; border-radius:16px; box-shadow: 0 10px 30px rgba(0,0,0,.5), inset 0 0 0 2px #1d1d1d; }
+  canvas { display:block; background:var(--lcd); border-radius:10px; box-shadow: inset 0 0 0 2px #2b2b2b; }
+  .hud { display:flex; gap:18px; flex-wrap:wrap; justify-content:center; }
+  .hud .stat { background:#0c150c; color:#b9ffb9; border:1px solid #1d3a1d; padding:8px 10px; border-radius:10px; min-width:120px; text-align:center; }
+  .buttons { display:flex; gap:10px; flex-wrap:wrap; justify-content:center; }
+  button { cursor:pointer; background:#123612; color:#caffca; border:1px solid #1f5a1f; border-bottom-width:3px; padding:10px 14px; border-radius:14px; font-weight:700; letter-spacing:0.3px; }
+  button:active { transform: translateY(1px); border-bottom-width:2px; }
+  .dpad { display:flex; align-items:center; gap:8px; }
+  .dpad > button { width:70px; }
+  .fire { width:120px; }
+  .hint { color:#a9d8a9; font-size:.92rem; opacity:.9; max-width:700px; text-align:center; }
+  .progress { width:220px; height:18px; background:#223522; border-radius:8px; overflow:hidden; margin-top:6px; }
+  .progress-bar { height:100%; background:#5aff5a; width:0%; transition:width 0.25s ease; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h2>🌠 Göktaşı Yağmuru 🌠</h2>
+    <div class="hud">
+      <div class="stat">PUAN: <span id="score">0</span></div>
+      <div class="stat">SEVİYE: <span id="level">1</span> / 10</div>
+      <div class="stat">CAN: <span id="lives">5</span></div>
+      <div class="stat">VURULAN BLOK: <span id="hits">0</span></div>
+      <div class="stat">HIZ: <span id="speed">1</span></div>
+      <div class="stat" id="state">Hazır</div>
+    </div>
+    <div class="progress" aria-label="Seviye hedefi (200 vuruluş)"><div id="progress-bar" class="progress-bar"></div></div>
+
+    <div class="bezel">
+      <canvas id="game" width="240" height="480" aria-label="Göktaşı Yağmuru"></canvas>
+    </div>
+
+    <div class="buttons">
+      <div class="dpad">
+        <button id="left" aria-label="Sola">◀︎</button>
+        <button id="right" aria-label="Sağa">▶︎</button>
+      </div>
+      <button id="fire" class="fire" aria-label="Ateş">ATEŞ (SPACE)</button>
+      <button id="start">BAŞLAT / DURAKLAT (Enter)</button>
+      <button id="reset">YENİ OYUN (R)</button>
+    </div>
+
+    <div class="hint">
+      PC: ◀︎/▶︎ ile hareket, <b>Boşluk</b> ile ateş, <b>Enter</b> ile başlat/duraklat, <b>R</b> ile sıfırla.<br/>
+      Mobil: ◀︎ ▶︎ ve ATEŞ düğmelerini kullan.
+    </div>
+  </div>
+
+<script>
+(() => {
+  // --- Temel refs ---
+  const cols=10, rows=20, size=24;
+  const canvas=document.getElementById('game');
+  const ctx=canvas.getContext('2d');
+  const scoreEl=document.getElementById('score');
+  const levelEl=document.getElementById('level');
+  const speedEl=document.getElementById('speed');
+  const stateEl=document.getElementById('state');
+  const hitsEl=document.getElementById('hits');
+  const livesEl=document.getElementById('lives');
+  const progBar=document.getElementById('progress-bar');
+
+  // --- Hız/Seviye ---
+  const baseFall=3600;     // 1. seviye: çok daha yavaş
+  const minFall=1800;      // taban limit (10. seviyede bile çok hızlanmasın)
+  const levelDelta=200;    // seviye başına ms azaltma
+  let fallInterval=baseFall;
+
+  const bulletSpeed=18;    // SABİT
+  const hitsPerLevel=200;  // 200 vuruluş = +1 seviye
+  const maxLevel=10;
+
+  // --- Durum ---
+  let blocks=new Set();    // 'x,y'
+  let bullets=[];          // {x,y,vy}
+  let cannon={x:5,y:rows-1,speed:6,movingL:false,movingR:false};
+  let running=false, paused=false, gameOver=false;
+  let score=0, level=1, lives=5, hits=0;
+  let fallTimer=0;
+  const canVibrate=('vibrate' in navigator);
+
+  // --- Yardımcılar ---
+  const key=(x,y)=>x+","+y;
+  const addBlock=(x,y)=>blocks.add(key(x,y));
+  const hasBlock=(x,y)=>blocks.has(key(x,y));
+  const removeBlock=(x,y)=>blocks.delete(key(x,y));
+
+  function seedBlocks(){
+    blocks.clear();
+    for(let y=0;y<6;y++){
+      for(let x=0;x<cols;x++) if(Math.random()<0.35) addBlock(x,y);
+    }
+  }
+
+  // --- Çizim ---
+  function draw(){
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.fillStyle=getComputedStyle(document.documentElement).getPropertyValue('--lcd');
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+
+    ctx.strokeStyle='rgba(0,0,0,0.15)';
+    for(let x=0;x<=cols;x++){ ctx.beginPath(); ctx.moveTo(x*size+0.5,0); ctx.lineTo(x*size+0.5,rows*size); ctx.stroke(); }
+    for(let y=0;y<=rows;y++){ ctx.beginPath(); ctx.moveTo(0,y*size+0.5); ctx.lineTo(cols*size,y*size+0.5); ctx.stroke(); }
+
+    // bloklar
+    ctx.fillStyle='#0a4a0a';
+    blocks.forEach(k=>{const [x,y]=k.split(',').map(Number); ctx.fillRect(x*size+2,y*size+2,size-4,size-4);});
+
+    // top
+    const cx=Math.round(cannon.x);
+    ctx.fillStyle='#063206';
+    ctx.fillRect(cx*size+2,cannon.y*size+6,size-4,size-8);
+    ctx.fillRect(cx*size+size/2-2,cannon.y*size-8,4,14);
+
+    // mermi
+    ctx.fillStyle='#073807';
+    bullets.forEach(b=>{ ctx.fillRect((b.x+0.5)*size-2,(b.y+0.5)*size-6,4,10); });
+
+    // overlay mesaj
+    if (gameOver) overlay('OYUN BİTTİ','R ile yeni oyun');
+    else if (!running) overlay('HAZIR','Enter / BAŞLAT ile başla');
+    else if (paused) overlay('DURAKLATILDI','Enter ile devam');
+  }
+
+  function overlay(title, sub){
+    ctx.fillStyle='rgba(0,0,0,.35)';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle='#042f04';
+    ctx.fillRect(20, canvas.height/2-46, canvas.width-40, 92);
+    ctx.strokeStyle='#0b530b';
+    ctx.strokeRect(20.5, canvas.height/2-46.5, canvas.width-41, 93);
+    ctx.fillStyle='#caffca';
+    ctx.font='bold 20px ui-monospace, monospace';
+    ctx.textAlign='center';
+    ctx.fillText(title, canvas.width/2, canvas.height/2-10);
+    ctx.font='14px ui-monospace, monospace';
+    ctx.fillText(sub, canvas.width/2, canvas.height/2+18);
+  }
+
+  // --- Oyun döngüsü ---
+  let last=0;
+  function loop(ts){
+    if(!last) last=ts;
+    const dt=Math.min(0.033,(ts-last)/1000); // 33ms clamp
+    last=ts;
+    if(running && !paused && !gameOver) update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  function update(dt){
+    // top hareketi
+    const dir=(cannon.movingR?1:0)-(cannon.movingL?1:0);
+    cannon.x += dir * cannon.speed * dt;
+    cannon.x = Math.max(0, Math.min(cols-1, cannon.x));
+
+    // mermiler
+    for(let i=bullets.length-1;i>=0;i--){
+      const b=bullets[i];
+      const oldY=b.y; b.y += (-bulletSpeed) * dt;
+      // basit çarpışma (tek hücre)
+      const gx=Math.round(b.x), gy=Math.floor(b.y);
+      if (gy>=0 && gy<rows && gx>=0 && gx<cols && hasBlock(gx,gy)){
+        removeBlock(gx,gy);
+        bullets.splice(i,1);
+        score+=10; scoreEl.textContent=score;
+        hits++; hitsEl.textContent=hits; updateProgress();
+
+        const newLevel=Math.min(Math.floor(hits/hitsPerLevel)+1, maxLevel);
+        if (newLevel!==level){
+          level=newLevel; levelEl.textContent=level;
+          fallInterval=Math.max(minFall, baseFall - (level-1)*levelDelta);
+          speedEl.textContent=level; // ekranda seviye numarası görünsün
+          if (level===maxLevel && hits>=hitsPerLevel*maxLevel){
+            gameOver=true; stateEl.textContent='TEBRİKLER! 10. seviyeyi tamamladın';
+          }
+        }
+      }
+      if (b.y < -1) bullets.splice(i,1);
+    }
+
+    // blok inişi
+    fallTimer += dt*1000;
+    if (fallTimer >= fallInterval){
+      fallTimer = 0;
+      // dip kontrolü + can
+      for (const k of blocks){
+        const [x,y]=k.split(',').map(Number);
+        if (y+1 >= rows){
+          lives--; livesEl.textContent=lives; stateEl.textContent='Can kaybı!';
+          if (canVibrate) navigator.vibrate(120);
+          if (lives<=0){ gameOver=true; return; }
+          bullets.length=0; seedBlocks();
+          return;
+        }
+      }
+      const next=new Set();
+      blocks.forEach(k=>{ const [x,y]=k.split(',').map(Number); next.add(key(x,y+1)); });
+      blocks=next;
+      if (blocks.size < 20){ for(let x=0;x<cols;x++) if(Math.random()<0.6) addBlock(x,0); }
+    }
+  }
+
+  // --- Eylemler ---
+  function fire(){ if(!running||paused||gameOver) return; bullets.push({x:Math.round(cannon.x), y:cannon.y-0.2, vy:-bulletSpeed}); }
+  function reset(){
+    blocks.clear(); bullets.length=0; score=0; level=1; lives=5; hits=0;
+    fallInterval=baseFall; fallTimer=0; cannon.x=5; cannon.y=rows-1;
+    running=false; paused=false; gameOver=false;
+    scoreEl.textContent=0; levelEl.textContent=1; speedEl.textContent=1;
+    livesEl.textContent=lives; hitsEl.textContent=hits; stateEl.textContent='Hazır';
+    updateProgress(); seedBlocks();
+  }
+  function updateProgress(){
+    const current=Math.min(hits-(level-1)*hitsPerLevel, hitsPerLevel);
+    const val=Math.max(0,current);
+    const pct=Math.min(100,(val/hitsPerLevel)*100);
+    if (progBar) progBar.style.width=pct+'%';
+  }
+
+  // --- Kontroller ---
+  const leftBtn=document.getElementById('left');
+  const rightBtn=document.getElementById('right');
+  const fireBtn=document.getElementById('fire');
+  const startBtn=document.getElementById('start');
+  const resetBtn=document.getElementById('reset');
+
+  function hold(el, on, off){
+    const down=e=>{e.preventDefault(); on();};
+    const up=()=>off();
+    el.addEventListener('pointerdown',down); el.addEventListener('pointerup',up);
+    el.addEventListener('pointercancel',up); el.addEventListener('pointerout',up);
+    // Fare/touch yedekleri
+    el.addEventListener('mousedown',down); el.addEventListener('mouseup',up);
+    el.addEventListener('touchstart',down,{passive:false}); el.addEventListener('touchend',up);
+  }
+  hold(leftBtn, ()=>cannon.movingL=true, ()=>cannon.movingL=false);
+  hold(rightBtn,()=>cannon.movingR=true,()=>cannon.movingR=false);
+  fireBtn.addEventListener('click', fire);
+  startBtn.addEventListener('click', ()=>{ if(gameOver){ reset(); } running=!running||paused; paused=false; stateEl.textContent= running?'Oynanıyor':'Hazır'; });
+  resetBtn.addEventListener('click', reset);
+
+  window.addEventListener('keydown',e=>{
+    if(e.code==='ArrowLeft')  cannon.movingL=true;
+    if(e.code==='ArrowRight') cannon.movingR=true;
+    if(e.code==='Space'){ e.preventDefault(); fire(); }
+    if(e.code==='Enter'){
+      if(gameOver){ reset(); running=true; }
+      else { if(!running) running=true; else paused=!paused; }
+      stateEl.textContent= paused?'Duraklatıldı': (running?'Oynanıyor':'Hazır');
+    }
+    if(e.code==='KeyR') reset();
+  });
+  window.addEventListener('keyup',e=>{ if(e.code==='ArrowLeft') cannon.movingL=false; if(e.code==='ArrowRight') cannon.movingR=false; });
+
+  // --- Başlat ---
+  reset();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
